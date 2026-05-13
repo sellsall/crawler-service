@@ -155,16 +155,21 @@ app.post('/crawl', requireSecret, async (req, res) => {
         if (isChallenge) {
             console.log(`[crawler] Cloudflare challenge detected for ${url} – waiting 8s for JS solve`);
             await page.waitForTimeout(8000);
-            // Try to wait for the page to load after JS challenge
             try {
                 await page.waitForFunction(
                     () => !document.title.toLowerCase().includes('just a moment'),
                     { timeout: 10000 }
                 );
             } catch (_) {}
-        } else {
-            // Give page some time for dynamic content
-            await page.waitForTimeout(1500);
+        }
+
+        // Wait for Vue/Nuxt/React to finish rendering (social links, footer, categories)
+        // Try networkidle first (all XHR done), fall back to a fixed delay
+        try {
+            await page.waitForLoadState('networkidle', { timeout: 8000 });
+        } catch (_) {
+            // networkidle timed out – still wait a fixed delay for JS frameworks
+            await page.waitForTimeout(3500);
         }
 
         const html  = await page.content();
