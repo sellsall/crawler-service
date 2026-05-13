@@ -1,0 +1,17 @@
+{
+  "name": "competitor-crawler-service",
+  "version": "1.0.0",
+  "description": "Headless browser fallback service for Cloudflare-protected stores",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "install-browser": "npx playwright install chromium"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "playwright": "^1.44.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
