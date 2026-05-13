@@ -90,7 +90,7 @@ function requireSecret(req, res, next) {
 }
 
 app.get('/health', async (_req, res) => {
-    const ready = browser && browser.isConnected();
+    const ready = !!(browser && browser.isConnected());
     res.json({ status: 'ok', browser_ready: ready, pid: process.pid });
 });
 
