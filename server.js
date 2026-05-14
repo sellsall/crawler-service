@@ -94,9 +94,62 @@ app.get('/health', async (_req, res) => {
     res.json({ status: 'ok', browser_ready: ready, pid: process.pid });
 });
 
+// ── Shared helper: load one page inside an existing context ──────────────────
+async function loadPage(context, url, timeout) {
+    const page = await context.newPage();
+    try {
+        // Block heavy resources to speed up loading
+        await page.route('**/*', route => {
+            const type = route.request().resourceType();
+            if (['image', 'media', 'font', 'other'].includes(type)) {
+                route.abort();
+            } else {
+                route.continue();
+            }
+        });
+
+        const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout });
+        const statusCode = response?.status() ?? 0;
+
+        // Cloudflare JS challenge handling
+        const isChallenge = await page.evaluate(() => {
+            const t = document.title.toLowerCase();
+            return t.includes('just a moment') || t.includes('checking your') ||
+                   t.includes('cloudflare') ||
+                   !!document.querySelector('#cf-wrapper, .cf-browser-verification');
+        });
+
+        if (isChallenge) {
+            console.log(`[crawler] CF challenge for ${url} – waiting 10s`);
+            await page.waitForTimeout(10000);
+            try {
+                await page.waitForFunction(
+                    () => !document.title.toLowerCase().includes('just a moment'),
+                    { timeout: 12000 }
+                );
+            } catch (_) {}
+        }
+
+        // Wait for Vue/Nuxt/React hydration
+        try {
+            await page.waitForLoadState('networkidle', { timeout: 8000 });
+        } catch (_) {
+            await page.waitForTimeout(3500);
+        }
+
+        const html     = await page.content();
+        const title    = await page.title();
+        const finalUrl = page.url();
+
+        return { html, title, statusCode, finalUrl };
+    } finally {
+        try { await page.close(); } catch (_) {}
+    }
+}
+
 // ── Main crawl endpoint ───────────────────────────────────────────────────────
 app.post('/crawl', requireSecret, async (req, res) => {
-    const { url, timeout = 20000 } = req.body;
+    const { url, timeout = 20000, product_urls = [] } = req.body;
 
     if (!url || typeof url !== 'string') {
         return res.status(400).json({ error: 'url is required' });
@@ -108,98 +161,66 @@ app.post('/crawl', requireSecret, async (req, res) => {
     try {
         const b = await getBrowser();
 
+        // Single context for ALL pages – CF cookies from homepage are reused for products
         context = await b.newContext({
             userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
             locale:    'ar-SA',
             viewport:  { width: 1366, height: 768 },
             extraHTTPHeaders: {
-                'Accept-Language':    'ar-SA,ar;q=0.9,en-US,en;q=0.8',
-                'Accept':             'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-                'Cache-Control':      'no-cache',
-                'Pragma':             'no-cache',
+                'Accept-Language':         'ar-SA,ar;q=0.9,en-US,en;q=0.8',
+                'Accept':                  'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                'Cache-Control':           'no-cache',
+                'Pragma':                  'no-cache',
                 'Upgrade-Insecure-Requests': '1',
             },
             ignoreHTTPSErrors: true,
         });
-
         await context.addInitScript(STEALTH_SCRIPT);
 
-        const page = await context.newPage();
+        // ── Load homepage (may solve Cloudflare challenge) ────────
+        const home = await loadPage(context, url, timeout);
+        console.log(`[crawler] homepage ${url} → ${home.statusCode} in ${Date.now() - start}ms`);
 
-        // Block heavy resources (images, fonts, media) to speed up loading
-        await page.route('**/*', route => {
-            const type = route.request().resourceType();
-            if (['image', 'media', 'font', 'other'].includes(type)) {
-                route.abort();
-            } else {
-                route.continue();
-            }
-        });
+        // ── Load product pages in SAME context (inherits CF cookies) ──
+        const productPages = [];
+        const validProductUrls = Array.isArray(product_urls) ? product_urls.filter(Boolean) : [];
 
-        let statusCode = 0;
-        const response = await page.goto(url, {
-            waitUntil: 'domcontentloaded',
-            timeout,
-        });
-        statusCode = response?.status() ?? 0;
-
-        // If Cloudflare challenge detected, wait longer for JS execution
-        const isChallenge = await page.evaluate(() => {
-            const title = document.title.toLowerCase();
-            return title.includes('just a moment') ||
-                   title.includes('checking your') ||
-                   title.includes('cloudflare') ||
-                   document.querySelector('#cf-wrapper, .cf-browser-verification') !== null;
-        });
-
-        if (isChallenge) {
-            console.log(`[crawler] Cloudflare challenge detected for ${url} – waiting 8s for JS solve`);
-            await page.waitForTimeout(8000);
+        for (const pUrl of validProductUrls.slice(0, 3)) {
+            const pStart = Date.now();
             try {
-                await page.waitForFunction(
-                    () => !document.title.toLowerCase().includes('just a moment'),
-                    { timeout: 10000 }
-                );
-            } catch (_) {}
+                // Product pages: shorter timeout, CF already solved
+                const pResult = await loadPage(context, pUrl, Math.min(timeout, 20000));
+                const pHtml   = pResult.html;
+                productPages.push({
+                    url:         pUrl,
+                    html:        (pHtml && pHtml.length > 500) ? pHtml : null,
+                    status_code: pResult.statusCode,
+                    elapsed_ms:  Date.now() - pStart,
+                });
+                console.log(`[crawler] product ${pUrl} → ${pResult.statusCode} in ${Date.now() - pStart}ms`);
+            } catch (err) {
+                console.warn(`[crawler] product page failed ${pUrl}: ${err.message}`);
+                productPages.push({ url: pUrl, html: null, error: err.message });
+            }
         }
-
-        // Wait for Vue/Nuxt/React to finish rendering (social links, footer, categories)
-        // Try networkidle first (all XHR done), fall back to a fixed delay
-        try {
-            await page.waitForLoadState('networkidle', { timeout: 8000 });
-        } catch (_) {
-            // networkidle timed out – still wait a fixed delay for JS frameworks
-            await page.waitForTimeout(3500);
-        }
-
-        const html  = await page.content();
-        const title = await page.title();
-        const finalUrl = page.url();
 
         await context.close();
         context = null;
 
-        const elapsed = Date.now() - start;
-        console.log(`[crawler] ${url} → ${statusCode} in ${elapsed}ms`);
-
         return res.json({
-            html,
-            title,
-            status_code: statusCode,
-            final_url:   finalUrl,
-            elapsed_ms:  elapsed,
-            strategy:    'headless',
+            html:          home.html,
+            title:         home.title,
+            status_code:   home.statusCode,
+            final_url:     home.finalUrl,
+            elapsed_ms:    Date.now() - start,
+            strategy:      'headless',
+            product_pages: productPages,
         });
 
     } catch (err) {
         console.error(`[crawler] Error for ${url}:`, err.message);
-        if (context) {
-            try { await context.close(); } catch (_) {}
-        }
-        return res.status(500).json({
-            error:    err.message,
-            strategy: 'headless_failed',
-        });
+        if (context) { try { await context.close(); } catch (_) {} }
+        return res.status(500).json({ error: err.message, strategy: 'headless_failed' });
     }
 });
 
