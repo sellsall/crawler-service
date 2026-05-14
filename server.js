@@ -94,31 +94,25 @@ app.get('/health', async (_req, res) => {
     res.json({ status: 'ok', browser_ready: ready, pid: process.pid });
 });
 
-// ── Shared helper: load one page inside an existing context ──────────────────
+// ── Helper: load a single page inside an existing context ────────────────────
 async function loadPage(context, url, timeout) {
     const page = await context.newPage();
     try {
-        // Block heavy resources to speed up loading
         await page.route('**/*', route => {
             const type = route.request().resourceType();
-            if (['image', 'media', 'font', 'other'].includes(type)) {
-                route.abort();
-            } else {
-                route.continue();
-            }
+            if (['image', 'media', 'font', 'other'].includes(type)) route.abort();
+            else route.continue();
         });
 
-        const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout });
+        const response   = await page.goto(url, { waitUntil: 'domcontentloaded', timeout });
         const statusCode = response?.status() ?? 0;
 
-        // Cloudflare JS challenge handling
         const isChallenge = await page.evaluate(() => {
             const t = document.title.toLowerCase();
             return t.includes('just a moment') || t.includes('checking your') ||
                    t.includes('cloudflare') ||
                    !!document.querySelector('#cf-wrapper, .cf-browser-verification');
         });
-
         if (isChallenge) {
             console.log(`[crawler] CF challenge for ${url} – waiting 10s`);
             await page.waitForTimeout(10000);
@@ -130,17 +124,12 @@ async function loadPage(context, url, timeout) {
             } catch (_) {}
         }
 
-        // Wait for Vue/Nuxt/React hydration
-        try {
-            await page.waitForLoadState('networkidle', { timeout: 8000 });
-        } catch (_) {
-            await page.waitForTimeout(3500);
-        }
+        try { await page.waitForLoadState('networkidle', { timeout: 8000 }); }
+        catch (_) { await page.waitForTimeout(3500); }
 
         const html     = await page.content();
         const title    = await page.title();
         const finalUrl = page.url();
-
         return { html, title, statusCode, finalUrl };
     } finally {
         try { await page.close(); } catch (_) {}
@@ -148,6 +137,12 @@ async function loadPage(context, url, timeout) {
 }
 
 // ── Main crawl endpoint ───────────────────────────────────────────────────────
+// Behaves like a human visitor:
+//   1. Open homepage, solve any CF challenge, wait for SPA hydration
+//   2. Auto-discover product links from the rendered DOM
+//      (or use explicitly-provided product_urls if given)
+//   3. Visit each product page in the SAME context → CF cookies inherited
+//   4. Return homepage HTML + all product page HTMLs
 app.post('/crawl', requireSecret, async (req, res) => {
     const { url, timeout = 20000, product_urls = [] } = req.body;
 
@@ -161,43 +156,108 @@ app.post('/crawl', requireSecret, async (req, res) => {
     try {
         const b = await getBrowser();
 
-        // Single context for ALL pages – CF cookies from homepage are reused for products
+        // One context for all pages – CF cookies are shared
         context = await b.newContext({
             userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
             locale:    'ar-SA',
             viewport:  { width: 1366, height: 768 },
             extraHTTPHeaders: {
-                'Accept-Language':         'ar-SA,ar;q=0.9,en-US,en;q=0.8',
-                'Accept':                  'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-                'Cache-Control':           'no-cache',
-                'Pragma':                  'no-cache',
+                'Accept-Language':           'ar-SA,ar;q=0.9,en-US,en;q=0.8',
+                'Accept':                    'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                'Cache-Control':             'no-cache',
+                'Pragma':                    'no-cache',
                 'Upgrade-Insecure-Requests': '1',
             },
             ignoreHTTPSErrors: true,
         });
         await context.addInitScript(STEALTH_SCRIPT);
 
-        // ── Load homepage (may solve Cloudflare challenge) ────────
-        const home = await loadPage(context, url, timeout);
-        console.log(`[crawler] homepage ${url} → ${home.statusCode} in ${Date.now() - start}ms`);
+        // ── Step 1: Load homepage (page stays open so we can read the DOM) ──
+        const page = await context.newPage();
+        await page.route('**/*', route => {
+            const type = route.request().resourceType();
+            if (['image', 'media', 'font', 'other'].includes(type)) route.abort();
+            else route.continue();
+        });
 
-        // ── Load product pages in SAME context (inherits CF cookies) ──
+        const homeResp   = await page.goto(url, { waitUntil: 'domcontentloaded', timeout });
+        const statusCode = homeResp?.status() ?? 0;
+
+        // Handle Cloudflare JS challenge
+        const isChallenge = await page.evaluate(() => {
+            const t = document.title.toLowerCase();
+            return t.includes('just a moment') || t.includes('checking your') ||
+                   t.includes('cloudflare') ||
+                   !!document.querySelector('#cf-wrapper, .cf-browser-verification');
+        });
+        if (isChallenge) {
+            console.log(`[crawler] CF challenge for ${url} – waiting 10s`);
+            await page.waitForTimeout(10000);
+            try {
+                await page.waitForFunction(
+                    () => !document.title.toLowerCase().includes('just a moment'),
+                    { timeout: 12000 }
+                );
+            } catch (_) {}
+        }
+
+        // Wait for SPA (Vue / Nuxt / React) to finish rendering
+        try { await page.waitForLoadState('networkidle', { timeout: 8000 }); }
+        catch (_) { await page.waitForTimeout(4000); }
+
+        const homepageHtml = await page.content();
+        const homepageTitle = await page.title();
+        const finalUrl      = page.url();
+        const origin        = new URL(finalUrl).origin;
+
+        console.log(`[crawler] homepage ${url} → ${statusCode} (${homepageHtml.length} bytes) in ${Date.now()-start}ms`);
+
+        // ── Step 2: Discover product links ─────────────────────────────────
+        // Use caller-supplied URLs if provided; otherwise mine from homepage DOM.
+        let urlsToVisit = Array.isArray(product_urls) ? product_urls.filter(Boolean) : [];
+
+        if (urlsToVisit.length === 0) {
+            urlsToVisit = await page.evaluate((storeOrigin) => {
+                const seen    = new Set();
+                const results = [];
+                for (const a of document.querySelectorAll('a[href]')) {
+                    const href = a.href;
+                    if (!href || !href.startsWith(storeOrigin)) continue;
+                    if (
+                        href.includes('/products/') || href.includes('/product/') ||
+                        href.includes('/item/')     || href.includes('/p/')        ||
+                        /\/\d{6,}/.test(href)
+                    ) {
+                        if (!seen.has(href)) {
+                            seen.add(href);
+                            results.push(href);
+                        }
+                        if (results.length >= 6) break;
+                    }
+                }
+                return results;
+            }, origin);
+
+            if (urlsToVisit.length > 0) {
+                console.log(`[crawler] Auto-discovered ${urlsToVisit.length} product URLs`);
+            }
+        }
+
+        await page.close(); // done with homepage page; context still alive
+
+        // ── Step 3: Visit product pages (same context → CF cookies inherited) ─
         const productPages = [];
-        const validProductUrls = Array.isArray(product_urls) ? product_urls.filter(Boolean) : [];
-
-        for (const pUrl of validProductUrls.slice(0, 3)) {
+        for (const pUrl of urlsToVisit.slice(0, 3)) {
             const pStart = Date.now();
             try {
-                // Product pages: shorter timeout, CF already solved
-                const pResult = await loadPage(context, pUrl, Math.min(timeout, 20000));
-                const pHtml   = pResult.html;
+                const p = await loadPage(context, pUrl, Math.min(timeout, 22000));
                 productPages.push({
                     url:         pUrl,
-                    html:        (pHtml && pHtml.length > 500) ? pHtml : null,
-                    status_code: pResult.statusCode,
+                    html:        (p.html && p.html.length > 500) ? p.html : null,
+                    status_code: p.statusCode,
                     elapsed_ms:  Date.now() - pStart,
                 });
-                console.log(`[crawler] product ${pUrl} → ${pResult.statusCode} in ${Date.now() - pStart}ms`);
+                console.log(`[crawler] product ${pUrl} → ${p.statusCode} in ${Date.now()-pStart}ms`);
             } catch (err) {
                 console.warn(`[crawler] product page failed ${pUrl}: ${err.message}`);
                 productPages.push({ url: pUrl, html: null, error: err.message });
@@ -208,10 +268,10 @@ app.post('/crawl', requireSecret, async (req, res) => {
         context = null;
 
         return res.json({
-            html:          home.html,
-            title:         home.title,
-            status_code:   home.statusCode,
-            final_url:     home.finalUrl,
+            html:          homepageHtml,
+            title:         homepageTitle,
+            status_code:   statusCode,
+            final_url:     finalUrl,
             elapsed_ms:    Date.now() - start,
             strategy:      'headless',
             product_pages: productPages,
