@@ -13,8 +13,13 @@
 
 'use strict';
 
-const express = require('express');
-const { chromium } = require('playwright');
+const express      = require('express');
+const { chromium } = require('playwright-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+
+// Register stealth plugin — patches ~20 Cloudflare/bot-detection vectors:
+// navigator.webdriver, chrome runtime, plugins, permissions, TLS, canvas, WebGL, etc.
+chromium.use(StealthPlugin());
 
 const app  = express();
 const PORT   = process.env.CRAWLER_PORT   || 3001;
@@ -41,8 +46,9 @@ async function getBrowser() {
                 '--disable-accelerated-2d-canvas',
                 '--no-first-run',
                 '--no-zygote',
-                '--single-process',
                 '--disable-extensions',
+                '--disable-web-security',
+                '--window-size=1366,768',
             ],
         }).then(b => {
             browser = b;
@@ -59,24 +65,8 @@ async function getBrowser() {
     return launchPromise;
 }
 
-// ── Stealth init script (remove bot signals) ─────────────────────────────────
-const STEALTH_SCRIPT = `
-    // Hide navigator.webdriver
-    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-    // Fake Chrome runtime
-    window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){}, app: {} };
-    // Fake plugins
-    Object.defineProperty(navigator, 'plugins', {
-        get: () => [
-            { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer' },
-            { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai' },
-        ]
-    });
-    Object.defineProperty(navigator, 'languages', { get: () => ['ar-SA', 'ar', 'en-US', 'en'] });
-    // Fake screen resolution
-    Object.defineProperty(screen, 'availWidth',  { get: () => 1366 });
-    Object.defineProperty(screen, 'availHeight', { get: () => 768 });
-`;
+// Stealth plugin handles all webdriver/fingerprint patching automatically.
+// No manual init script needed.
 
 // ── Health check ─────────────────────────────────────────────────────────────
 // ── Secret validation middleware ────────────────────────────────────────────
@@ -170,7 +160,6 @@ app.post('/crawl', requireSecret, async (req, res) => {
             },
             ignoreHTTPSErrors: true,
         });
-        await context.addInitScript(STEALTH_SCRIPT);
 
         // ── Step 1: Load homepage (page stays open so we can read the DOM) ──
         const page = await context.newPage();
@@ -220,21 +209,42 @@ app.post('/crawl', requireSecret, async (req, res) => {
             urlsToVisit = await page.evaluate((storeOrigin) => {
                 const seen    = new Set();
                 const results = [];
+
+                // Helper: does this URL look like a product page?
+                function isProductUrl(href) {
+                    return href.includes('/products/') || href.includes('/product/') ||
+                           href.includes('/item/')     || href.includes('/p/')        ||
+                           /\/\d{5,}(?:[/?#]|$)/.test(href)  ||   // /12345 at path end
+                           /[_-]\d{5,}(?:[/?#]|$)/.test(href);    // slug-12345
+                }
+
+                // 1) Scan all <a> tags
                 for (const a of document.querySelectorAll('a[href]')) {
                     const href = a.href;
                     if (!href || !href.startsWith(storeOrigin)) continue;
-                    if (
-                        href.includes('/products/') || href.includes('/product/') ||
-                        href.includes('/item/')     || href.includes('/p/')        ||
-                        /\/\d{6,}/.test(href)
-                    ) {
-                        if (!seen.has(href)) {
-                            seen.add(href);
-                            results.push(href);
-                        }
+                    if (isProductUrl(href) && !seen.has(href)) {
+                        seen.add(href);
+                        results.push(href);
                         if (results.length >= 6) break;
                     }
                 }
+
+                // 2) Fallback: look for elements with data-product-id and follow their nearest link
+                if (results.length === 0) {
+                    const cards = document.querySelectorAll('[data-product-id], [data-id]');
+                    for (const card of cards) {
+                        const a = card.querySelector('a[href]') || (card.tagName === 'A' ? card : null);
+                        if (!a) continue;
+                        const href = a.href;
+                        if (!href || !href.startsWith(storeOrigin)) continue;
+                        if (!seen.has(href)) {
+                            seen.add(href);
+                            results.push(href);
+                            if (results.length >= 6) break;
+                        }
+                    }
+                }
+
                 return results;
             }, origin);
 
