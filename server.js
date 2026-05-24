@@ -199,19 +199,19 @@ app.post('/crawl', requireSecret, async (req, res) => {
                    !!document.querySelector('#cf-wrapper, .cf-browser-verification');
         });
         if (isChallenge) {
-            console.log(`[crawler] CF challenge for ${url} – waiting 10s`);
-            await page.waitForTimeout(10000);
+            console.log(`[crawler] CF challenge for ${url} – waiting 6s`);
+            await page.waitForTimeout(6000);
             try {
                 await page.waitForFunction(
                     () => !document.title.toLowerCase().includes('just a moment'),
-                    { timeout: 12000 }
+                    { timeout: 8000 }
                 );
             } catch (_) {}
         }
 
         // Wait for SPA (Vue / Nuxt / React) to finish rendering
-        try { await page.waitForLoadState('networkidle', { timeout: 8000 }); }
-        catch (_) { await page.waitForTimeout(4000); }
+        try { await page.waitForLoadState('networkidle', { timeout: 5000 }); }
+        catch (_) { await page.waitForTimeout(2000); }
 
         const homepageHtml = await page.content();
         const homepageTitle = await page.title();
