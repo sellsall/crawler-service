@@ -163,7 +163,7 @@ app.post('/crawl', requireSecret, async (req, res) => {
 
     // ── Hard timeout: ALWAYS send a response within 55s no matter what ──────
     // Prevents Chrome from hanging PHP indefinitely.
-    const HARD_TIMEOUT_MS = 55000;
+    const HARD_TIMEOUT_MS = 75000;
     let context    = null;
     let responded  = false;
     const start    = Date.now();
