@@ -54,10 +54,18 @@ async function getBrowser() {
                 '--disable-blink-features=AutomationControlled',
                 '--disable-dev-shm-usage',
                 '--disable-accelerated-2d-canvas',
+                '--disable-gpu',
+                '--disable-software-rasterizer',
+                '--disable-background-networking',
+                '--disable-background-timer-throttling',
+                '--disable-renderer-backgrounding',
+                '--disable-sync',
+                '--metrics-recording-only',
                 '--no-first-run',
                 '--no-zygote',
                 '--disable-extensions',
                 '--window-size=1366,768',
+                '--js-flags=--max-old-space-size=256',
             ],
         };
 
@@ -145,13 +153,7 @@ async function loadPage(context, url, timeout) {
     }
 }
 
-// ── Main crawl endpoint ───────────────────────────────────────────────────────
-// Behaves like a human visitor:
-//   1. Open homepage, solve any CF challenge, wait for SPA hydration
-//   2. Auto-discover product links from the rendered DOM
-//      (or use explicitly-provided product_urls if given)
-//   3. Visit each product page in the SAME context → CF cookies inherited
-//   4. Return homepage HTML + all product page HTMLs
+// ── Main crawl endpoint ──────────────────────────────────────────────────────
 app.post('/crawl', requireSecret, async (req, res) => {
     const { url, timeout = 20000, product_urls = [] } = req.body;
 
@@ -159,8 +161,25 @@ app.post('/crawl', requireSecret, async (req, res) => {
         return res.status(400).json({ error: 'url is required' });
     }
 
-    let context = null;
-    const start = Date.now();
+    // ── Hard timeout: ALWAYS send a response within 55s no matter what ──────
+    // Prevents Chrome from hanging PHP indefinitely.
+    const HARD_TIMEOUT_MS = 55000;
+    let context    = null;
+    let responded  = false;
+    const start    = Date.now();
+
+    function safeRespond(statusCode, data) {
+        if (responded) return;
+        responded = true;
+        clearTimeout(hardTimer);
+        res.status(statusCode).json(data);
+    }
+
+    const hardTimer = setTimeout(async () => {
+        console.warn(`[crawler] HARD TIMEOUT (${HARD_TIMEOUT_MS}ms) for ${url}`);
+        if (context) { try { await context.close(); } catch (_) {} }
+        safeRespond(500, { error: `hard_timeout: Chrome did not respond within ${HARD_TIMEOUT_MS/1000}s`, strategy: 'headless_timeout' });
+    }, HARD_TIMEOUT_MS);
 
     try {
         const b = await getBrowser();
@@ -180,7 +199,7 @@ app.post('/crawl', requireSecret, async (req, res) => {
             ignoreHTTPSErrors: true,
         });
 
-        // ── Step 1: Load homepage (page stays open so we can read the DOM) ──
+        // ── Step 1: Load homepage ──────────────────────────────────────
         const page = await context.newPage();
         await page.route('**/*', route => {
             const type = route.request().resourceType();
@@ -209,11 +228,11 @@ app.post('/crawl', requireSecret, async (req, res) => {
             } catch (_) {}
         }
 
-        // Wait for SPA (Vue / Nuxt / React) to finish rendering
+        // Wait for SPA to render (with short timeout to avoid blocking)
         try { await page.waitForLoadState('networkidle', { timeout: 5000 }); }
         catch (_) { await page.waitForTimeout(2000); }
 
-        const homepageHtml = await page.content();
+        const homepageHtml  = await page.content();
         const homepageTitle = await page.title();
         const finalUrl      = page.url();
         const origin        = new URL(finalUrl).origin;
@@ -221,23 +240,18 @@ app.post('/crawl', requireSecret, async (req, res) => {
         console.log(`[crawler] homepage ${url} → ${statusCode} (${homepageHtml.length} bytes) in ${Date.now()-start}ms`);
 
         // ── Step 2: Discover product links ─────────────────────────────────
-        // Use caller-supplied URLs if provided; otherwise mine from homepage DOM.
         let urlsToVisit = Array.isArray(product_urls) ? product_urls.filter(Boolean) : [];
 
         if (urlsToVisit.length === 0) {
             urlsToVisit = await page.evaluate((storeOrigin) => {
                 const seen    = new Set();
                 const results = [];
-
-                // Helper: does this URL look like a product page?
                 function isProductUrl(href) {
                     return href.includes('/products/') || href.includes('/product/') ||
                            href.includes('/item/')     || href.includes('/p/')        ||
-                           /\/\d{5,}(?:[/?#]|$)/.test(href)  ||   // /12345 at path end
-                           /[_-]\d{5,}(?:[/?#]|$)/.test(href);    // slug-12345
+                           /\/\d{5,}(?:[/?#]|$)/.test(href)  ||
+                           /[_-]\d{5,}(?:[/?#]|$)/.test(href);
                 }
-
-                // 1) Scan all <a> tags
                 for (const a of document.querySelectorAll('a[href]')) {
                     const href = a.href;
                     if (!href || !href.startsWith(storeOrigin)) continue;
@@ -247,8 +261,6 @@ app.post('/crawl', requireSecret, async (req, res) => {
                         if (results.length >= 6) break;
                     }
                 }
-
-                // 2) Fallback: look for elements with data-product-id and follow their nearest link
                 if (results.length === 0) {
                     const cards = document.querySelectorAll('[data-product-id], [data-id]');
                     for (const card of cards) {
@@ -263,18 +275,16 @@ app.post('/crawl', requireSecret, async (req, res) => {
                         }
                     }
                 }
-
                 return results;
             }, origin);
-
             if (urlsToVisit.length > 0) {
                 console.log(`[crawler] Auto-discovered ${urlsToVisit.length} product URLs`);
             }
         }
 
-        await page.close(); // done with homepage page; context still alive
+        await page.close();
 
-        // ── Step 3: Visit product pages (same context → CF cookies inherited) ─
+        // ── Step 3: Visit product pages ───────────────────────────────────
         const productPages = [];
         for (const pUrl of urlsToVisit.slice(0, 3)) {
             const pStart = Date.now();
@@ -296,7 +306,7 @@ app.post('/crawl', requireSecret, async (req, res) => {
         await context.close();
         context = null;
 
-        return res.json({
+        safeRespond(200, {
             html:          homepageHtml,
             title:         homepageTitle,
             status_code:   statusCode,
@@ -309,7 +319,7 @@ app.post('/crawl', requireSecret, async (req, res) => {
     } catch (err) {
         console.error(`[crawler] Error for ${url}:`, err.message);
         if (context) { try { await context.close(); } catch (_) {} }
-        return res.status(500).json({ error: err.message, strategy: 'headless_failed' });
+        safeRespond(500, { error: err.message, strategy: 'headless_failed' });
     }
 });
 
