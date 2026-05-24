@@ -175,10 +175,12 @@ app.post('/crawl', requireSecret, async (req, res) => {
         res.status(statusCode).json(data);
     }
 
-    const hardTimer = setTimeout(async () => {
+    const hardTimer = setTimeout(() => {
         console.warn(`[crawler] HARD TIMEOUT (${HARD_TIMEOUT_MS}ms) for ${url}`);
-        if (context) { try { await context.close(); } catch (_) {} }
+        // Respond FIRST before any async cleanup – context.close() can itself hang
         safeRespond(500, { error: `hard_timeout: Chrome did not respond within ${HARD_TIMEOUT_MS/1000}s`, strategy: 'headless_timeout' });
+        // Close context in background, do not await
+        if (context) { context.close().catch(() => {}); }
     }, HARD_TIMEOUT_MS);
 
     try {
