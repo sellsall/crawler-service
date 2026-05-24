@@ -155,7 +155,7 @@ async function loadPage(context, url, timeout) {
 
 // ── Main crawl endpoint ──────────────────────────────────────────────────────
 app.post('/crawl', requireSecret, async (req, res) => {
-    const { url, timeout = 20000, product_urls = [] } = req.body;
+    const { url, timeout = 20000, product_urls = [], max_products = 3 } = req.body;
 
     if (!url || typeof url !== 'string') {
         return res.status(400).json({ error: 'url is required' });
@@ -241,8 +241,11 @@ app.post('/crawl', requireSecret, async (req, res) => {
 
         console.log(`[crawler] homepage ${url} → ${statusCode} (${homepageHtml.length} bytes) in ${Date.now()-start}ms`);
 
-        // ── Step 2: Discover product links ─────────────────────────────────
-        let urlsToVisit = Array.isArray(product_urls) ? product_urls.filter(Boolean) : [];
+        // ── Step 2: Discover product links (skip if max_products=0) ───────
+        let urlsToVisit = [];
+
+        if (max_products > 0) {
+        urlsToVisit = Array.isArray(product_urls) ? product_urls.filter(Boolean) : [];
 
         if (urlsToVisit.length === 0) {
             urlsToVisit = await page.evaluate((storeOrigin) => {
@@ -283,12 +286,13 @@ app.post('/crawl', requireSecret, async (req, res) => {
                 console.log(`[crawler] Auto-discovered ${urlsToVisit.length} product URLs`);
             }
         }
+        } // end if (max_products > 0)
 
         await page.close();
 
         // ── Step 3: Visit product pages ───────────────────────────────────
         const productPages = [];
-        for (const pUrl of urlsToVisit.slice(0, 3)) {
+        for (const pUrl of urlsToVisit.slice(0, max_products)) {
             const pStart = Date.now();
             try {
                 const p = await loadPage(context, pUrl, Math.min(timeout, 22000));
