@@ -36,7 +36,17 @@ async function getBrowser() {
     if (browser && browser.isConnected()) return browser;
 
     if (!launchPromise) {
-        launchPromise = chromium.launch({
+        // Try real Google Chrome first (better TLS fingerprint, trusted by Cloudflare).
+        // Falls back to Playwright's Chromium if Chrome is not installed.
+        const chromePaths = [
+            '/usr/bin/google-chrome-stable',
+            '/usr/bin/google-chrome',
+            '/usr/bin/chromium-browser',
+        ];
+        const fs = require('fs');
+        const installedChrome = chromePaths.find(p => fs.existsSync(p));
+
+        const launchOptions = {
             headless: true,
             args: [
                 '--no-sandbox',
@@ -47,10 +57,19 @@ async function getBrowser() {
                 '--no-first-run',
                 '--no-zygote',
                 '--disable-extensions',
-                '--disable-web-security',
                 '--window-size=1366,768',
             ],
-        }).then(b => {
+        };
+
+        if (installedChrome) {
+            launchOptions.executablePath = installedChrome;
+            console.log('[crawler] Using real Chrome: ' + installedChrome);
+        } else {
+            launchOptions.channel = undefined; // use Playwright Chromium
+            console.log('[crawler] Chrome not found – using Playwright Chromium (run: apt-get install google-chrome-stable)');
+        }
+
+        launchPromise = chromium.launch(launchOptions).then(b => {
             browser = b;
             launchPromise = null;
             console.log('[crawler] Chromium launched');
