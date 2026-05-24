@@ -155,7 +155,7 @@ async function loadPage(context, url, timeout) {
 
 // ── Main crawl endpoint ──────────────────────────────────────────────────────
 app.post('/crawl', requireSecret, async (req, res) => {
-    const { url, timeout = 20000, product_urls = [], max_products = 3 } = req.body;
+    const { url, timeout = 20000, product_urls = [], max_products = 0 } = req.body;
 
     if (!url || typeof url !== 'string') {
         return res.status(400).json({ error: 'url is required' });
