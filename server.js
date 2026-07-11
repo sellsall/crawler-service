@@ -230,9 +230,29 @@ app.post('/crawl', requireSecret, async (req, res) => {
             } catch (_) {}
         }
 
-        // Wait for SPA to render (with short timeout to avoid blocking)
+        // Wait for SPA to render
         try { await page.waitForLoadState('networkidle', { timeout: 5000 }); }
         catch (_) { await page.waitForTimeout(2000); }
+
+        // ── Auto-scroll to trigger Lazy Loading (Footer, SVGs, Payments) ──
+        try {
+            await page.evaluate(async () => {
+                await new Promise((resolve) => {
+                    let totalHeight = 0;
+                    const distance = 600;
+                    const timer = setInterval(() => {
+                        window.scrollBy(0, distance);
+                        totalHeight += distance;
+                        if (totalHeight >= document.body.scrollHeight || totalHeight > 15000) {
+                            clearInterval(timer);
+                            window.scrollTo(0, 0);
+                            resolve();
+                        }
+                    }, 100);
+                });
+            });
+            await page.waitForTimeout(1000);
+        } catch (_) {}
 
         const homepageHtml  = await page.content();
         const homepageTitle = await page.title();
