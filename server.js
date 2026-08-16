@@ -168,18 +168,24 @@ app.post('/crawl', requireSecret, async (req, res) => {
     let responded  = false;
     const start    = Date.now();
 
-    function safeRespond(statusCode, data) {
+    function safeRespond(statusCode, data, headers = null) {
         if (responded) return;
         responded = true;
         clearTimeout(hardTimer);
+        
+        if (headers) {
+            for (const [k, v] of Object.entries(headers)) {
+                res.set(k, v);
+            }
+        }
+        
         res.status(statusCode).json(data);
     }
 
     const hardTimer = setTimeout(() => {
         console.warn(`[crawler] HARD TIMEOUT (${HARD_TIMEOUT_MS}ms) for ${url}`);
-        // Respond FIRST before any async cleanup – context.close() can itself hang
         safeRespond(500, { error: `hard_timeout: Chrome did not respond within ${HARD_TIMEOUT_MS/1000}s`, strategy: 'headless_timeout' });
-        // Close context in background, do not await
+        // Close context in background, do not await, catch errors to avoid unhandled rejections
         if (context) { context.close().catch(() => {}); }
     }, HARD_TIMEOUT_MS);
 
@@ -332,25 +338,25 @@ app.post('/crawl', requireSecret, async (req, res) => {
         await context.close();
         context = null;
 
-        const responseData = {
-            html:          homepageHtml,
-            title:         homepageTitle,
-            status_code:   statusCode,
-            final_url:     finalUrl,
-            elapsed_ms:    Date.now() - start,
-            strategy:      'headless',
-            product_pages: productPages,
-        };
-
         const fs = require('fs');
         const path = require('path');
         const os = require('os');
-        const tmpPath = path.join(os.tmpdir(), `crawler_${Date.now()}_${Math.floor(Math.random()*1000)}.json`);
-        fs.writeFileSync(tmpPath, JSON.stringify(responseData));
+        const tmpPath = path.join(os.tmpdir(), `crawler_${Date.now()}_${Math.floor(Math.random()*1000)}.html`);
+        
+        fs.writeFileSync(tmpPath, homepageHtml || '');
 
         if (!responded) {
             responded = true;
             clearTimeout(hardTimer);
+            
+            // Set metadata as custom headers
+            res.set('X-Crawler-Status', statusCode.toString());
+            res.set('X-Crawler-Elapsed', (Date.now() - start).toString());
+            res.set('X-Crawler-Title', encodeURIComponent(homepageTitle || ''));
+            res.set('X-Crawler-Final-Url', encodeURIComponent(finalUrl || ''));
+            
+            // Send pure HTML file
+            res.type('text/html');
             res.sendFile(tmpPath, (err) => {
                 try { fs.unlinkSync(tmpPath); } catch (e) {}
             });
@@ -358,8 +364,9 @@ app.post('/crawl', requireSecret, async (req, res) => {
 
     } catch (err) {
         console.error(`[crawler] Error for ${url}:`, err.message);
-        if (context) { try { await context.close(); } catch (_) {} }
         safeRespond(500, { error: err.message, strategy: 'headless_failed' });
+        // Close context asynchronously in background, do not await to prevent hanging!
+        if (context) { context.close().catch(() => {}); }
     }
 });
 
