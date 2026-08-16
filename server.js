@@ -242,21 +242,34 @@ app.post('/crawl', requireSecret, async (req, res) => {
 
         // ── Auto-scroll to trigger Lazy Loading (Footer, SVGs, Payments) ──
         try {
-            await page.evaluate(async () => {
-                await new Promise((resolve) => {
-                    let totalHeight = 0;
-                    const distance = 600;
-                    const timer = setInterval(() => {
-                        window.scrollBy(0, distance);
-                        totalHeight += distance;
-                        if (totalHeight >= document.body.scrollHeight || totalHeight > 15000) {
-                            clearInterval(timer);
-                            window.scrollTo(0, 0);
+            await Promise.race([
+                page.evaluate(async () => {
+                    await new Promise((resolve, reject) => {
+                        try {
+                            if (!document.body) return resolve();
+                            let totalHeight = 0;
+                            const distance = 600;
+                            const timer = setInterval(() => {
+                                try {
+                                    window.scrollBy(0, distance);
+                                    totalHeight += distance;
+                                    if (totalHeight >= (document.body.scrollHeight || 0) || totalHeight > 15000) {
+                                        clearInterval(timer);
+                                        window.scrollTo(0, 0);
+                                        resolve();
+                                    }
+                                } catch (e) {
+                                    clearInterval(timer);
+                                    resolve();
+                                }
+                            }, 100);
+                        } catch (e) {
                             resolve();
                         }
-                    }, 100);
-                });
-            });
+                    });
+                }),
+                new Promise(resolve => setTimeout(resolve, 3500))
+            ]);
             await page.waitForTimeout(1000);
         } catch (_) {}
 
