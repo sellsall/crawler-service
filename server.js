@@ -332,7 +332,7 @@ app.post('/crawl', requireSecret, async (req, res) => {
         await context.close();
         context = null;
 
-        safeRespond(200, {
+        const responseData = {
             html:          homepageHtml,
             title:         homepageTitle,
             status_code:   statusCode,
@@ -340,7 +340,21 @@ app.post('/crawl', requireSecret, async (req, res) => {
             elapsed_ms:    Date.now() - start,
             strategy:      'headless',
             product_pages: productPages,
-        });
+        };
+
+        const fs = require('fs');
+        const path = require('path');
+        const os = require('os');
+        const tmpPath = path.join(os.tmpdir(), `crawler_${Date.now()}_${Math.floor(Math.random()*1000)}.json`);
+        fs.writeFileSync(tmpPath, JSON.stringify(responseData));
+
+        if (!responded) {
+            responded = true;
+            clearTimeout(hardTimer);
+            res.sendFile(tmpPath, (err) => {
+                try { fs.unlinkSync(tmpPath); } catch (e) {}
+            });
+        }
 
     } catch (err) {
         console.error(`[crawler] Error for ${url}:`, err.message);
